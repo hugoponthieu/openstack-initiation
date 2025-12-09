@@ -1,0 +1,29 @@
+# =============================================================================
+# Example terraform.tfvars file
+# Copy this file to terraform.tfvars and customize the values
+# =============================================================================
+
+# Compute Settings
+key_name           = "duratm"
+image              = "ubuntu-noble"
+web_flavor         = "m1.small"
+db_flavor          = "m1.medium"
+web_instance_count = 2
+
+# Network Settings
+public_net             = "public"
+private_net_cidr       = "10.0.1.0/24"
+private_net_gateway    = "10.0.1.1"
+private_net_pool_start = "10.0.1.10"
+private_net_pool_end   = "10.0.1.200"
+dns_nameservers        = ["8.8.8.8", "8.8.4.4"]
+
+# Database Settings
+db_name     = "apidb"
+db_user     = "apiuser"
+db_password = "SecurePassword123!"
+
+# Project Settings
+environment  = "dev"
+project_name = "web-api"
+
