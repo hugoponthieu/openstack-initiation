@@ -1,0 +1,617 @@
+heat_template_version: 2021-04-16
+
+description: >
+  Load Balanced Web API with PostgreSQL Database
+  Deploys 2 web API instances behind an Octavia load balancer
+  with a separate PostgreSQL database instance.
+
+parameters:
+  key_name:
+    type: string
+    description: Name of keypair to assign to servers
+    default: hercules
+
+  image:
+    type: string
+    description: Name of image to use for servers
+    default: ubuntu-noble
+
+  web_flavor:
+    type: string
+    description: Flavor to use for web API servers
+    default: m1.small
+
+  db_flavor:
+    type: string
+    description: Flavor to use for database server
+    default: m1.medium
+
+  public_net:
+    type: string
+    description: >
+      Name or ID of public network for floating IP allocations
+    default: public
+
+  private_net_cidr:
+    type: string
+    description: Private network address (CIDR notation)
+    default: 10.0.1.0/24
+
+  private_net_gateway:
+    type: string
+    description: Private network gateway address
+    default: 10.0.1.1
+
+  private_net_pool_start:
+    type: string
+    description: Start of private network IP address allocation pool
+    default: 10.0.1.10
+
+  private_net_pool_end:
+    type: string
+    description: End of private network IP address allocation pool
+    default: 10.0.1.200
+
+  db_name:
+    type: string
+    description: Database name
+    default: apidb
+
+  db_user:
+    type: string
+    description: Database username
+    default: apiuser
+
+  db_password:
+    type: string
+    description: Database password
+    hidden: true
+    default: SecurePassword123!
+
+resources:
+  # Network Resources
+  private_net:
+    type: OS::Neutron::Net
+    properties:
+      name: web_api_private_network
+
+  private_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network_id: { get_resource: private_net }
+      cidr: { get_param: private_net_cidr }
+      gateway_ip: { get_param: private_net_gateway }
+      allocation_pools:
+        - start: { get_param: private_net_pool_start }
+          end: { get_param: private_net_pool_end }
+      dns_nameservers:
+        - 8.8.8.8
+        - 8.8.4.4
+
+  router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network: { get_param: public_net }
+
+  router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: router }
+      subnet_id: { get_resource: private_subnet }
+
+  # Security Groups
+  web_api_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Security group for web API servers
+      name: web_api_sg
+      rules:
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: tcp
+          port_range_min: 80
+          port_range_max: 80
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: icmp
+
+  database_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Security group for database server
+      name: database_sg
+      rules:
+        - remote_mode: remote_group_id
+          remote_group_id: { get_resource: web_api_security_group }
+          protocol: tcp
+          port_range_min: 5432
+          port_range_max: 5432
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: icmp
+
+  # Database Instance
+  database_instance:
+    type: OS::Nova::Server
+    properties:
+      name: postgresql_database
+      image: { get_param: image }
+      flavor: { get_param: db_flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: database_port }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash
+            set -e
+            
+            # Update system
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get upgrade -y
+            
+            # Install PostgreSQL
+            apt-get install -y postgresql postgresql-contrib
+            
+            # Wait for PostgreSQL to be ready
+            sleep 5
+            
+            # Configure PostgreSQL
+            sudo -u postgres psql -c "CREATE DATABASE $db_name;"
+            sudo -u postgres psql -c "CREATE USER $db_user WITH PASSWORD '$db_password';"
+            sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $db_name TO $db_user;"
+            
+            # Create sample table and data
+            sudo -u postgres psql -d $db_name -c "CREATE TABLE items (id SERIAL PRIMARY KEY, name VARCHAR(100), description TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);"
+            sudo -u postgres psql -d $db_name -c "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO $db_user;"
+            sudo -u postgres psql -d $db_name -c "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO $db_user;"
+            sudo -u postgres psql -d $db_name -c "INSERT INTO items (name, description) VALUES ('Sample Item 1', 'This is a test item from the database'), ('Sample Item 2', 'Another test item'), ('Sample Item 3', 'Yet another test item');"
+            
+            # Configure PostgreSQL to accept connections from private network
+            echo "host    all             all             10.0.1.0/24             md5" >> /etc/postgresql/*/main/pg_hba.conf
+            sed -i "s/#listen_addresses = 'localhost'/listen_addresses = '*'/" /etc/postgresql/*/main/postgresql.conf
+            
+            # Restart PostgreSQL
+            systemctl restart postgresql
+            systemctl enable postgresql
+            
+            # Create status file
+            echo "PostgreSQL setup completed at $(date)" > /var/log/db-setup-complete.log
+          params:
+            $db_name: { get_param: db_name }
+            $db_user: { get_param: db_user }
+            $db_password: { get_param: db_password }
+
+  database_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_net }
+      security_groups:
+        - { get_resource: database_security_group }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+
+  # Web API Instance 1
+  web_api_instance_1:
+    type: OS::Nova::Server
+    depends_on: database_instance
+    properties:
+      name: web_api_server_1
+      image: { get_param: image }
+      flavor: { get_param: web_flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: web_api_port_1 }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash
+            set -e
+            
+            # Update system
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get upgrade -y
+            
+            # Install dependencies
+            apt-get install -y python3 python3-pip python3-venv postgresql-client
+            
+            # Create app directory
+            mkdir -p /opt/webapp
+            cd /opt/webapp
+            
+            # Create virtual environment
+            python3 -m venv venv
+            source venv/bin/activate
+            
+            # Install Python packages
+            pip install flask psycopg2-binary gunicorn
+            
+            # Create Flask application
+            cat > /opt/webapp/app.py << 'EOFAPP'
+            from flask import Flask, jsonify
+            import psycopg2
+            import socket
+            import os
+            
+            app = Flask(__name__)
+            
+            DB_HOST = os.environ.get('DB_HOST', '$db_host')
+            DB_NAME = os.environ.get('DB_NAME', '$db_name')
+            DB_USER = os.environ.get('DB_USER', '$db_user')
+            DB_PASSWORD = os.environ.get('DB_PASSWORD', '$db_password')
+            
+            def get_db_connection():
+                try:
+                    conn = psycopg2.connect(
+                        host=DB_HOST,
+                        database=DB_NAME,
+                        user=DB_USER,
+                        password=DB_PASSWORD
+                    )
+                    return conn
+                except Exception as e:
+                    return None
+            
+            @app.route('/')
+            def index():
+                hostname = socket.gethostname()
+                return jsonify({
+                    'message': 'Welcome to the Web API',
+                    'server': hostname,
+                    'status': 'running'
+                })
+            
+            @app.route('/health')
+            def health():
+                return jsonify({'status': 'healthy'}), 200
+            
+            @app.route('/api/data')
+            def get_data():
+                hostname = socket.gethostname()
+                conn = get_db_connection()
+                if conn is None:
+                    return jsonify({
+                        'error': 'Database connection failed',
+                        'server': hostname
+                    }), 500
+                
+                try:
+                    cur = conn.cursor()
+                    cur.execute('SELECT id, name, description, created_at FROM items;')
+                    rows = cur.fetchall()
+                    cur.close()
+                    conn.close()
+                    
+                    items = []
+                    for row in rows:
+                        items.append({
+                            'id': row[0],
+                            'name': row[1],
+                            'description': row[2],
+                            'created_at': str(row[3])
+                        })
+                    
+                    return jsonify({
+                        'server': hostname,
+                        'data': items
+                    })
+                except Exception as e:
+                    return jsonify({
+                        'error': str(e),
+                        'server': hostname
+                    }), 500
+            
+            if __name__ == '__main__':
+                app.run(host='0.0.0.0', port=80)
+            EOFAPP
+            
+            # Create systemd service
+            cat > /etc/systemd/system/webapp.service << 'EOFSVC'
+            [Unit]
+            Description=Flask Web API
+            After=network.target
+            
+            [Service]
+            Type=simple
+            User=root
+            WorkingDirectory=/opt/webapp
+            Environment="DB_HOST=$db_host"
+            Environment="DB_NAME=$db_name"
+            Environment="DB_USER=$db_user"
+            Environment="DB_PASSWORD=$db_password"
+            ExecStart=/opt/webapp/venv/bin/gunicorn -w 4 -b 0.0.0.0:80 app:app
+            Restart=always
+            
+            [Install]
+            WantedBy=multi-user.target
+            EOFSVC
+            
+            # Start service
+            systemctl daemon-reload
+            systemctl start webapp
+            systemctl enable webapp
+            
+            # Create status file
+            echo "Web API setup completed at $(date)" > /var/log/webapp-setup-complete.log
+          params:
+            $db_host: { get_attr: [database_instance, first_address] }
+            $db_name: { get_param: db_name }
+            $db_user: { get_param: db_user }
+            $db_password: { get_param: db_password }
+
+  web_api_port_1:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_net }
+      security_groups:
+        - { get_resource: web_api_security_group }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+
+  # Web API Instance 2
+  web_api_instance_2:
+    type: OS::Nova::Server
+    depends_on: database_instance
+    properties:
+      name: web_api_server_2
+      image: { get_param: image }
+      flavor: { get_param: web_flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: web_api_port_2 }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash
+            set -e
+            
+            # Update system
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get upgrade -y
+            
+            # Install dependencies
+            apt-get install -y python3 python3-pip python3-venv postgresql-client
+            
+            # Create app directory
+            mkdir -p /opt/webapp
+            cd /opt/webapp
+            
+            # Create virtual environment
+            python3 -m venv venv
+            source venv/bin/activate
+            
+            # Install Python packages
+            pip install flask psycopg2-binary gunicorn
+            
+            # Create Flask application
+            cat > /opt/webapp/app.py << 'EOFAPP'
+            from flask import Flask, jsonify
+            import psycopg2
+            import socket
+            import os
+            
+            app = Flask(__name__)
+            
+            DB_HOST = os.environ.get('DB_HOST', '$db_host')
+            DB_NAME = os.environ.get('DB_NAME', '$db_name')
+            DB_USER = os.environ.get('DB_USER', '$db_user')
+            DB_PASSWORD = os.environ.get('DB_PASSWORD', '$db_password')
+            
+            def get_db_connection():
+                try:
+                    conn = psycopg2.connect(
+                        host=DB_HOST,
+                        database=DB_NAME,
+                        user=DB_USER,
+                        password=DB_PASSWORD
+                    )
+                    return conn
+                except Exception as e:
+                    return None
+            
+            @app.route('/')
+            def index():
+                hostname = socket.gethostname()
+                return jsonify({
+                    'message': 'Welcome to the Web API',
+                    'server': hostname,
+                    'status': 'running'
+                })
+            
+            @app.route('/health')
+            def health():
+                return jsonify({'status': 'healthy'}), 200
+            
+            @app.route('/api/data')
+            def get_data():
+                hostname = socket.gethostname()
+                conn = get_db_connection()
+                if conn is None:
+                    return jsonify({
+                        'error': 'Database connection failed',
+                        'server': hostname
+                    }), 500
+                
+                try:
+                    cur = conn.cursor()
+                    cur.execute('SELECT id, name, description, created_at FROM items;')
+                    rows = cur.fetchall()
+                    cur.close()
+                    conn.close()
+                    
+                    items = []
+                    for row in rows:
+                        items.append({
+                            'id': row[0],
+                            'name': row[1],
+                            'description': row[2],
+                            'created_at': str(row[3])
+                        })
+                    
+                    return jsonify({
+                        'server': hostname,
+                        'data': items
+                    })
+                except Exception as e:
+                    return jsonify({
+                        'error': str(e),
+                        'server': hostname
+                    }), 500
+            
+            if __name__ == '__main__':
+                app.run(host='0.0.0.0', port=80)
+            EOFAPP
+            
+            # Create systemd service
+            cat > /etc/systemd/system/webapp.service << 'EOFSVC'
+            [Unit]
+            Description=Flask Web API
+            After=network.target
+            
+            [Service]
+            Type=simple
+            User=root
+            WorkingDirectory=/opt/webapp
+            Environment="DB_HOST=$db_host"
+            Environment="DB_NAME=$db_name"
+            Environment="DB_USER=$db_user"
+            Environment="DB_PASSWORD=$db_password"
+            ExecStart=/opt/webapp/venv/bin/gunicorn -w 4 -b 0.0.0.0:80 app:app
+            Restart=always
+            
+            [Install]
+            WantedBy=multi-user.target
+            EOFSVC
+            
+            # Start service
+            systemctl daemon-reload
+            systemctl start webapp
+            systemctl enable webapp
+            
+            # Create status file
+            echo "Web API setup completed at $(date)" > /var/log/webapp-setup-complete.log
+          params:
+            $db_host: { get_attr: [database_instance, first_address] }
+            $db_name: { get_param: db_name }
+            $db_user: { get_param: db_user }
+            $db_password: { get_param: db_password }
+
+  web_api_port_2:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_net }
+      security_groups:
+        - { get_resource: web_api_security_group }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+
+  # Load Balancer Resources
+  loadbalancer:
+    type: OS::Octavia::LoadBalancer
+    properties:
+      vip_subnet: { get_resource: private_subnet }
+      name: web_api_lb
+
+  listener:
+    type: OS::Octavia::Listener
+    properties:
+      loadbalancer: { get_resource: loadbalancer }
+      protocol: HTTP
+      protocol_port: 80
+      name: web_api_listener
+
+  pool:
+    type: OS::Octavia::Pool
+    properties:
+      listener: { get_resource: listener }
+      lb_algorithm: ROUND_ROBIN
+      protocol: HTTP
+      name: web_api_pool
+
+  health_monitor:
+    type: OS::Octavia::HealthMonitor
+    properties:
+      pool: { get_resource: pool }
+      type: HTTP
+      delay: 5
+      timeout: 3
+      max_retries: 3
+      url_path: /health
+
+  pool_member_1:
+    type: OS::Octavia::PoolMember
+    properties:
+      pool: { get_resource: pool }
+      address: { get_attr: [web_api_instance_1, first_address] }
+      protocol_port: 80
+      subnet: { get_resource: private_subnet }
+
+  pool_member_2:
+    type: OS::Octavia::PoolMember
+    properties:
+      pool: { get_resource: pool }
+      address: { get_attr: [web_api_instance_2, first_address] }
+      protocol_port: 80
+      subnet: { get_resource: private_subnet }
+
+  floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: { get_param: public_net }
+      port_id: { get_attr: [loadbalancer, vip_port_id] }
+
+outputs:
+  loadbalancer_floating_ip:
+    description: Floating IP address of the load balancer
+    value: { get_attr: [floating_ip, floating_ip_address] }
+
+  loadbalancer_url:
+    description: URL to access the load balanced web API
+    value:
+      str_replace:
+        template: http://$ip/
+        params:
+          $ip: { get_attr: [floating_ip, floating_ip_address] }
+
+  api_data_url:
+    description: URL to access database data through the API
+    value:
+      str_replace:
+        template: http://$ip/api/data
+        params:
+          $ip: { get_attr: [floating_ip, floating_ip_address] }
+
+  web_api_server_1_ip:
+    description: Private IP address of web API server 1
+    value: { get_attr: [web_api_instance_1, first_address] }
+
+  web_api_server_2_ip:
+    description: Private IP address of web API server 2
+    value: { get_attr: [web_api_instance_2, first_address] }
+
+  database_server_ip:
+    description: Private IP address of database server
+    value: { get_attr: [database_instance, first_address] }
+
+  database_connection_string:
+    description: PostgreSQL connection string
+    value:
+      str_replace:
+        template: postgresql://$user:$pass@$host/$dbname
+        params:
+          $user: { get_param: db_user }
+          $pass: { get_param: db_password }
+          $host: { get_attr: [database_instance, first_address] }
+          $dbname: { get_param: db_name }
